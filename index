@@ -1,0 +1,183 @@
+
+"""
+Unified prediction API for all 8 models.
+Runs as a single Vercel Python serverless function (WSGI via Flask, natively
+supported by @vercel/python). Locally: `python api/index.py` then hit
+http://localhost:5000/api/health
+"""
+import os, json, joblib
+import numpy as np
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+MODELS = os.path.join(BASE, "models")
+
+app = Flask(__name__)
+CORS(app)  # allow the frontend (different origin during local dev) to call this API
+
+_cache = {}
+
+
+def load(name):
+    """Lazy-load + cache a model/scaler/meta trio so cold starts only load what's used."""
+    if name in _cache:
+        return _cache[name]
+    model = joblib.load(os.path.join(MODELS, f"{name}_model.joblib"))
+    scaler = joblib.load(os.path.join(MODELS, f"{name}_scaler.joblib"))
+    with open(os.path.join(MODELS, f"{name}_meta.json")) as f:
+        meta = json.load(f)
+    _cache[name] = (model, scaler, meta)
+    return model, scaler, meta
+
+
+def build_row(payload, meta):
+    """Turn a JSON payload into the exact feature vector order the model expects,
+    applying the same categorical encoders used at training time."""
+    encoders = meta.get("encoders", {})
+    row = []
+    for feat in meta["features"]:
+        val = payload.get(feat)
+        if val is None:
+            raise ValueError(f"Missing required field: {feat}")
+        base_feat = feat.replace("_enc", "").replace("_log", "")
+        if feat in encoders:
+            enc_map = encoders[feat]
+            if val not in enc_map:
+                raise ValueError(f"Unknown category '{val}' for field '{feat}'. "
+                                  f"Valid options: {list(enc_map.keys())}")
+            val = enc_map[val]
+        elif feat.endswith("_enc") and base_feat in encoders:
+            enc_map = encoders[base_feat]
+            if val not in enc_map:
+                raise ValueError(f"Unknown category '{val}' for field '{base_feat}'.")
+            val = enc_map[val]
+        elif feat.endswith("_log"):
+            val = np.log1p(float(val))
+        row.append(float(val))
+    return np.array(row).reshape(1, -1)
+
+
+def classify_response(model, scaler, meta, payload):
+    X = build_row(payload, meta)
+    Xs = scaler.transform(X)
+    pred = int(model.predict(Xs)[0])
+    proba = float(model.predict_proba(Xs)[0][1])
+    return {"prediction": pred, "probability": round(proba, 4), "model_used": meta["best_model"]}
+
+
+def regress_response(model, scaler, meta, payload):
+    X = build_row(payload, meta)
+    Xs = scaler.transform(X)
+    pred = float(model.predict(Xs)[0])
+    if meta.get("log_target"):
+        pred = float(np.expm1(pred))
+    return {"prediction": round(pred, 2), "model_used": meta["best_model"]}
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "available_models": [
+        "heart", "churn", "loan", "house", "car", "fraud", "ipl", "stock"
+    ]})
+
+
+@app.route("/api/meta/<name>", methods=["GET"])
+def get_meta(name):
+    try:
+        _, _, meta = load(name)
+        return jsonify(meta)
+    except FileNotFoundError:
+        return jsonify({"error": f"unknown model '{name}'"}), 404
+
+
+@app.route("/api/predict/heart", methods=["POST"])
+def predict_heart():
+    model, scaler, meta = load("heart")
+    try:
+        return jsonify(classify_response(model, scaler, meta, request.json))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/predict/churn", methods=["POST"])
+def predict_churn():
+    model, scaler, meta = load("churn")
+    try:
+        return jsonify(classify_response(model, scaler, meta, request.json))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/predict/loan", methods=["POST"])
+def predict_loan():
+    model, scaler, meta = load("loan")
+    payload = dict(request.json)
+    try:
+        income = float(payload.get("ApplicantIncome", 0)) + float(payload.get("CoapplicantIncome", 0))
+        payload["TotalIncome_log"] = np.log1p(income)
+        payload["LoanAmount_log"] = np.log1p(float(payload.get("LoanAmount", 0)))
+        return jsonify(classify_response(model, scaler, meta, payload))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/predict/house", methods=["POST"])
+def predict_house():
+    model, scaler, meta = load("house")
+    try:
+        return jsonify(regress_response(model, scaler, meta, request.json))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/predict/car", methods=["POST"])
+def predict_car():
+    model, scaler, meta = load("car")
+    try:
+        return jsonify(regress_response(model, scaler, meta, request.json))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/predict/fraud", methods=["POST"])
+def predict_fraud():
+    model, scaler, meta = load("fraud")
+    try:
+        return jsonify(classify_response(model, scaler, meta, request.json))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/predict/ipl", methods=["POST"])
+def predict_ipl():
+    model, scaler, meta = load("ipl")
+    payload = dict(request.json)
+    try:
+        payload["toss_won_by_team1"] = 1 if payload.get("toss_winner") == payload.get("team1") else 0
+        # feature keys in meta are e.g. "team1_enc" but encoders are keyed "team1"
+        renamed = {}
+        for k, v in payload.items():
+            if f"{k}_enc" in meta["features"]:
+                renamed[f"{k}_enc"] = v
+            else:
+                renamed[k] = v
+        result = classify_response(model, scaler, meta, renamed)
+        team1_wins = result["prediction"] == 1
+        result["predicted_winner"] = payload.get("team1") if team1_wins else payload.get("team2")
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/predict/stock", methods=["POST"])
+def predict_stock():
+    model, scaler, meta = load("stock")
+    try:
+        return jsonify(regress_response(model, scaler, meta, request.json))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
